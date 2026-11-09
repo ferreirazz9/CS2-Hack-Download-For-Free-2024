@@ -197,7 +197,29 @@ function LocalStore(){
     watch(c, cb, f){ const s={c,cb,f}; subs.push(s); setTimeout(() => cb(list(c,f), {fromCache:false})); return () => { const i=subs.indexOf(s); if(i>=0) subs.splice(i,1); }; },
     async put(c,id,v){ (data[c] || (data[c]={}))[id] = v; save(); notify(c); },
     async del(c,id){ if(data[c]) delete data[c][id]; save(); notify(c); },
-    async query(c,f,v){ return list(c,[f,v]); }
+    async query(c,f,v){ return list(c,[f,v]); },
+    async putMany(c,rows){ (data[c] || (data[c]={})); rows.forEach(r => data[c][r.id] = r.data); save(); notify(c); },
+    async delMany(c,ids){ if(data[c]) ids.forEach(id => delete data[c][id]); save(); notify(c); }
+  };
+}
+/* Google Planilhas (Apps Script): o servidor guarda tudo na planilha; o app atualiza a cada 20 s */
+function GasStore(run, getPin){
+  const cache = {turmas:[], alunos:[], aulas:[], chamadas:[]};
+  const subs = [];
+  const call = (fn, ...args) => new Promise((res, rej) => run.withSuccessHandler(res).withFailureHandler(e => {
+    const msg = String((e && e.message) || e);
+    rej({code: /PIN/.test(msg) ? "pin" : "unavailable", message: msg});
+  })[fn](...args));
+  const emit = () => subs.forEach(s => s.cb(s.f ? cache[s.c].filter(d => d[s.f[0]] === s.f[1]) : cache[s.c], {fromCache:false}));
+  const apply = st => { if (!st) return; Object.keys(cache).forEach(k => { if (st[k]) cache[k] = st[k]; }); emit(); };
+  return {
+    watch(c, cb, f, onErr){ const s = {c,cb,f,onErr}; subs.push(s); return () => { const i = subs.indexOf(s); if (i >= 0) subs.splice(i,1); }; },
+    put: (c,id,v) => call("apiPut", getPin(), c, id, v, hojeISO()).then(apply),
+    del: (c,id) => call("apiDel", getPin(), c, [id], hojeISO()).then(apply),
+    putMany: (c,rows) => call("apiPutMany", getPin(), c, rows, hojeISO()).then(apply),
+    delMany: (c,ids) => call("apiDel", getPin(), c, ids, hojeISO()).then(apply),
+    query: (c,f,v) => call("apiQuery", getPin(), c, f, v),
+    refresh: () => call("apiLoad", getPin(), hojeISO()).then(apply)
   };
 }
 function DbStore(db){
@@ -206,7 +228,9 @@ function DbStore(db){
     watch(c, cb, f, onErr){ let q = db.collection(c); if(f) q = q.where(f[0],"==",f[1]); return q.onSnapshot(s => cb(rows(s), s.metadata), e => onErr && onErr(e)); },
     put: (c,id,v) => db.collection(c).doc(id).set(v),
     del: (c,id) => db.collection(c).doc(id).delete(),
-    async query(c,f,v){ return rows(await db.collection(c).where(f,"==",v).get()); }
+    async query(c,f,v){ return rows(await db.collection(c).where(f,"==",v).get()); },
+    async putMany(c,list){ for (const r of list) await db.collection(c).doc(r.id).set(r.data); },
+    async delMany(c,ids){ for (const id of ids) await db.collection(c).doc(id).delete(); }
   };
 }
 
@@ -227,7 +251,7 @@ const alunosDa = id => S.alunos.filter(a => a.turmaId === id).sort(porNome);
 const chamadaDe = aulaId => S.chamadas.find(c => c.aulaId === aulaId && c.data === S.hoje);
 const minha = a => S.mode === "local" || (!!a.ownerId && a.ownerId === S.uid);
 const semDono = a => S.mode !== "local" && !a.ownerId;
-const podeEditar = a => !S.readOnly && (minha(a) || semDono(a) || S.isOwner);
+const podeEditar = a => !S.readOnly && (minha(a) || semDono(a) || S.isOwner || S.mode === "gas");
 const chaveNome = n => String(n||"").normalize("NFD").replace(/[̀-ͯ]/g,"").toLowerCase().replace(/\s+/g," ").trim();
 const diaHoje = () => new Date().getDay();
 const aulasHoje = () => S.aulas.filter(a => (a.dias||[]).includes(diaHoje())).sort((a,b) => (a.inicio||"").localeCompare(b.inicio||"") || (a.materia||"").localeCompare(b.materia||"","pt-BR"));
@@ -273,7 +297,8 @@ async function grava(fn, ok){
   try { await fn(); if (ok) toast(ok); return true; }
   catch(e){
     const code = e && e.code;
-    if (code === "invalid_argument" && S.mode === "db"){ S.readOnly = true; banner(); renderMain(); toast("Sem permissão para salvar. Peça acesso de Colaborador a quem compartilhou."); }
+    if (code === "pin"){ pedirPin(true); }
+    else if (code === "invalid_argument" && S.mode === "db"){ S.readOnly = true; banner(); renderMain(); toast("Sem permissão para salvar. Peça acesso de Colaborador a quem compartilhou."); }
     else if (code === "quota_exceeded") toast("O diário atingiu o limite de registros. Apague turmas ou aulas antigas.");
     else toast("Não foi possível salvar. Verifique a internet e tente de novo.");
     return false;
@@ -297,7 +322,13 @@ function banner(msg){
 function renderMain(){
   document.querySelectorAll(".tab").forEach(b => b.setAttribute("aria-current", b.dataset.tab === S.tab ? "page" : "false"));
   const m = $("#main");
-  if (!S.store){ m.innerHTML = '<div class="loading">Conectando ao diário…</div>'; return; }
+  if (S.precisaPin){
+    m.innerHTML = '<form class="panel" data-form="pin"><h2>PIN da escola</h2><p class="muted" style="margin:0">'+(S.pinErrado ? "PIN incorreto. Confira com a coordenação." : "Digite o PIN que a coordenação passou. Ele fica salvo neste celular.")+'</p>'+
+      '<input class="input" id="pin" inputmode="numeric" autocomplete="off" aria-label="PIN" style="font-size:1.4rem;letter-spacing:.3em;text-align:center">'+
+      '<button class="btn primary block" type="submit">Entrar</button></form>';
+    return;
+  }
+  if (!S.store || !S.carregou){ m.innerHTML = '<div class="loading">Conectando ao diário…</div>'; return; }
   m.innerHTML = ({hoje:vHoje, lanches:vLanches, turmas:vTurmas, aulas:vAulas}[S.tab] || vHoje)();
 }
 
@@ -318,7 +349,7 @@ function vHoje(){
       '<div class="row"><button class="btn primary" data-goto="turmas">Criar turma</button><button class="btn ghost" data-act="nova-aula">Cadastrar aula</button></div></div>';
   }
   let lista = aulasHoje();
-  const multi = S.mode === "db";
+  const multi = S.mode !== "local";
   const temMinhas = S.aulas.some(minha);
   let aviso = "";
   if (multi && S.filtro === "minhas"){
@@ -380,14 +411,14 @@ function linhaAula(a){
   const t = turma(a.turmaId);
   const dias = (a.dias||[]).slice().sort().map(d => DIAS[d]).join(", ");
   return '<div class="item"><div class="grow"><b>'+esc(a.materia)+'</b><div class="muted small">'+esc(t ? t.nome : "Turma removida")+' · '+esc(dias || "sem dias")+' · '+esc(a.inicio)+'–'+esc(a.fim)+(a.professor ? '<br>'+esc(a.professor) : '')+'</div></div>'+
-    '<div class="row" style="flex-wrap:nowrap">'+(semDono(a) && !S.readOnly ? '<button class="btn accent" data-act="assumir" data-id="'+esc(a.id)+'">Assumir</button>' : '')+
+    '<div class="row" style="flex-wrap:nowrap">'+((semDono(a) || (S.mode === "gas" && !minha(a))) && !S.readOnly ?'<button class="btn accent" data-act="assumir" data-id="'+esc(a.id)+'">Assumir</button>' : '')+
     (podeEditar(a) && !semDono(a) ? '<button class="btn ghost" data-act="editar-aula" data-id="'+esc(a.id)+'">Editar</button>' : '')+
     '<button class="btn primary" data-act="chamada" data-id="'+esc(a.id)+'">Chamada</button></div></div>';
 }
 function vAulas(){
   const ord = (a,b) => (a.materia||"").localeCompare(b.materia||"","pt-BR") || (a.inicio||"").localeCompare(b.inicio||"");
   const minhas = S.aulas.filter(minha).sort(ord), livres = S.aulas.filter(semDono).sort(ord), outras = S.aulas.filter(a => !minha(a) && !semDono(a)).sort(ord);
-  let h = '<div class="row between"><h2>'+(S.mode==="db" ? "Minhas aulas" : "Aulas")+'</h2>'+(S.readOnly ? '' : '<button class="btn accent" data-act="nova-aula">+ Nova aula</button>')+'</div>';
+  let h = '<div class="row between"><h2>'+(S.mode!=="local" ? "Minhas aulas" : "Aulas")+'</h2>'+(S.readOnly ? '' : '<button class="btn accent" data-act="nova-aula">+ Nova aula</button>')+'</div>';
   h += minhas.length ? '<div class="list">'+minhas.map(linhaAula).join("")+'</div>'
     : '<div class="panel"><p style="margin:0" class="muted">Cadastre sua matéria com o nome que preferir, a turma, os dias da semana e o horário. Ela aparece na aba Hoje nos dias certos.</p></div>';
   if (livres.length) h += '<div class="stack"><h2>Aulas sem professor</h2><p class="muted small" style="margin:0">Toque em <b>Assumir</b> nas aulas que você dá. Elas passam a aparecer em "Minhas aulas" com o seu nome.</p><div class="list">'+livres.map(linhaAula).join("")+'</div></div>';
@@ -491,7 +522,8 @@ function sAula(s){
   const a = s.id ? S.aulas.find(x => x.id === s.id) : null;
   const v = s.v || (s.v = a ? {materia:a.materia, professor:a.professor||"", turmaId:a.turmaId, dias:(a.dias||[]).slice(), inicio:a.inicio, fim:a.fim}
     : {materia:"", professor:lsGet("diario-professor") || S.meuNome || "", turmaId:(S.turmas.slice().sort(porNome)[0]||{}).id||"", dias:[], inicio:"07:30", fim:"08:20"});
-  let h = head(a ? "Editar aula" : "Nova aula", a ? a.materia : "Sua matéria, turma e horário");
+  if (s.assumir && !v.professor) v.professor = lsGet("diario-professor") || S.meuNome || "";
+  let h = head(s.assumir ? "Assumir aula" : a ? "Editar aula" : "Nova aula", s.assumir ? "Confira seu nome e salve" : a ? a.materia : "Sua matéria, turma e horário");
   h += '<form class="sheet-body wrap gut" data-form="aula">';
   if (!S.turmas.length) h += '<div class="panel"><p style="margin:0">Crie uma turma antes de cadastrar a aula.</p><div><button type="button" class="btn primary" data-goto="turmas">Ir para Turmas</button></div></div>';
   h += '<div class="field"><label for="f-materia">Matéria</label><input class="input" id="f-materia" required maxlength="60" placeholder="Ex.: Matemática, Ciências, Inglês" value="'+esc(v.materia)+'"></div>';
@@ -502,8 +534,8 @@ function sAula(s){
     [1,2,3,4,5,6].map(d => '<button type="button" class="chip" data-act="dia" data-v="'+d+'" aria-pressed="'+v.dias.includes(d)+'">'+DIAS[d]+'</button>').join("")+'</div></div>';
   h += '<div class="grid2"><div class="field"><label for="f-ini">Início</label><input class="input" type="time" id="f-ini" required value="'+esc(v.inicio)+'"></div>'+
     '<div class="field"><label for="f-fim">Fim</label><input class="input" type="time" id="f-fim" required value="'+esc(v.fim)+'"></div></div>';
-  h += '<button class="btn primary block" type="submit"'+(S.turmas.length?"":" disabled")+'>'+(a ? "Salvar alterações" : "Cadastrar aula")+'</button>';
-  if (a) h += '<button type="button" class="btn danger block" data-act="del-aula" data-id="'+esc(a.id)+'">Excluir aula</button>';
+  h += '<button class="btn primary block" type="submit"'+(S.turmas.length?"":" disabled")+'>'+(s.assumir ? "Assumir esta aula" : a ? "Salvar alterações" : "Cadastrar aula")+'</button>';
+  if (a && !s.assumir) h +='<button type="button" class="btn danger block" data-act="del-aula" data-id="'+esc(a.id)+'">Excluir aula</button>';
   return h+'</form>';
 }
 function lerFormAula(){
@@ -519,9 +551,9 @@ async function salvarAula(){
   if (!v.dias.length) return toast("Marque pelo menos um dia da semana.");
   if (!v.inicio || !v.fim || v.fim <= v.inicio) return toast("O horário de fim precisa ser depois do início.");
   const old = s.id ? S.aulas.find(x => x.id === s.id) : null;
-  const doc = {materia:v.materia, professor:v.professor, turmaId:v.turmaId, dias:v.dias.slice().sort(), inicio:v.inicio, fim:v.fim, ownerId: old ? old.ownerId : S.uid};
+  const doc = {materia:v.materia, professor:v.professor, turmaId:v.turmaId, dias:v.dias.slice().sort(), inicio:v.inicio, fim:v.fim, ownerId: (old && !s.assumir) ? old.ownerId : S.uid};
   if (v.professor) lsSet("diario-professor", v.professor);
-  const ok = await grava(() => S.store.put("aulas", s.id || novoId(), doc), old ? "Aula atualizada" : "Aula cadastrada");
+  const ok = await grava(() => S.store.put("aulas", s.id || novoId(), doc), s.assumir ? "Aula assumida" : old ? "Aula atualizada" : "Aula cadastrada");
   if (ok){ S.tab = "aulas"; fecharSheet(); }
 }
 
@@ -557,7 +589,7 @@ document.addEventListener("click", async ev => {
     case "del-turma": {
       if (!armado(b, "Toque de novo para excluir")) break;
       const al = alunosDa(id);
-      const ok = await grava(async () => { for (const x of al) await S.store.del("alunos", x.id); await S.store.del("turmas", id); }, "Turma excluída");
+      const ok = await grava(async () => { if (al.length) await S.store.delMany("alunos", al.map(x => x.id)); await S.store.del("turmas", id); }, "Turma excluída");
       if (ok) fecharSheet(); break;
     }
     case "del-aula": {
@@ -568,6 +600,7 @@ document.addEventListener("click", async ev => {
     case "assumir": {
       const a = S.aulas.find(x => x.id === id); if (!a) break;
       const nome = lsGet("diario-professor") || S.meuNome || "";
+      if (S.mode === "gas"){ abrirSheet({tipo:"aula", id, assumir:true}); if (!a.professor || a.ownerId) S.sheet.v.professor = nome; renderSheet(); break; }
       const doc = Object.assign({}, a); delete doc.id; doc.ownerId = S.uid; if (nome && !doc.professor) doc.professor = nome;
       await grava(() => S.store.put("aulas", id, doc), "Aula assumida: "+a.materia);
       break;
@@ -579,6 +612,11 @@ document.addEventListener("submit", async ev => {
   const f = ev.target.closest("[data-form]"); if (!f) return;
   ev.preventDefault();
   const tipo = f.dataset.form;
+  if (tipo === "pin"){
+    const v = $("#pin").value.trim(); if (!v) return;
+    lsSet("diario-pin", v); S.pin = v; S.precisaPin = false; S.pinErrado = false; renderMain(); atualizaGas();
+    return;
+  }
   if (tipo === "nova-turma"){
     const inp = $("#nova-turma"), nome = inp.value.trim(); if (!nome) return;
     if (S.turmas.some(t => t.nome.toLowerCase() === nome.toLowerCase())) return toast("Já existe uma turma com esse nome.");
@@ -589,7 +627,7 @@ document.addEventListener("submit", async ev => {
     const existentes = new Set(alunosDa(s.id).map(a => a.nome.toLowerCase()));
     const nomes = [...new Set(ta.value.split(/\r?\n/).map(x => x.replace(/^\s*\d+[\s.\-–)]*/, "").trim()).filter(Boolean))].filter(n => !existentes.has(n.toLowerCase()));
     if (!nomes.length) return toast("Nenhum nome novo para adicionar.");
-    const ok = await grava(async () => { for (const nome of nomes) await S.store.put("alunos", novoId(), {turmaId:s.id, nome: nome.slice(0,80)}); }, nomes.length+(nomes.length===1?" aluno adicionado":" alunos adicionados"));
+    const ok = await grava(() => S.store.putMany("alunos", nomes.map(nome => ({id: novoId(), data: {turmaId:s.id, nome: nome.slice(0,80)}}))), nomes.length+(nomes.length===1?" aluno adicionado":" alunos adicionados"));
     if (ok){ ta.value = ""; renderSheet(); }
   } else if (tipo === "renomear-turma"){
     const nome = $("#nome-turma").value.trim(); if (!nome) return;
@@ -633,6 +671,7 @@ function assinaChamadas(){
 }
 function iniciar(store){
   S.store = store;
+  if (S.mode !== "gas") S.carregou = true;
   store.watch("turmas", onData("turmas"), null, onErr);
   store.watch("alunos", onData("alunos"), null, onErr);
   store.watch("aulas", onData("aulas"), null, onErr);
@@ -641,8 +680,37 @@ function iniciar(store){
   banner(); renderMain();
 }
 
+/* Google Planilhas: PIN e atualização periódica */
+function pedirPin(errado){ S.precisaPin = true; S.pinErrado = !!errado; if (errado) lsSet("diario-pin", ""); if (S.sheet) fecharSheet(); else renderMain(); }
+let gasOcupado = false;
+async function atualizaGas(){
+  if (S.mode !== "gas" || S.precisaPin || gasOcupado) return;
+  gasOcupado = true;
+  try {
+    await S.store.refresh();
+    if (!S.carregou){ S.carregou = true; renderMain(); }
+    if (loadTimer){ clearTimeout(loadTimer); loadTimer = null; }
+    banner();
+  } catch(e){
+    if (e && e.code === "pin") pedirPin(!!S.pin);
+    else banner("Sem conexão com a planilha agora. Tentando de novo…");
+  } finally { gasOcupado = false; }
+}
+
 async function boot(){
   renderData(); renderMain();
+  const gas = typeof google !== "undefined" && google.script && google.script.run;
+  if (gas){
+    S.mode = "gas";
+    let dev = lsGet("diario-dispositivo"); if (!dev){ dev = "d-" + novoId(); lsSet("diario-dispositivo", dev); }
+    S.uid = dev; S.isOwner = false; S.meuNome = lsGet("diario-professor") || "";
+    S.pin = lsGet("diario-pin") || "";
+    iniciar(GasStore(google.script.run, () => S.pin));
+    if (!S.pin) pedirPin(false); else atualizaGas();
+    setInterval(() => { if (document.visibilityState === "visible") atualizaGas(); }, 20000);
+    document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") atualizaGas(); });
+    return;
+  }
   // espera o visor do Claude (se houver) expor o runtime
   let tries = 0;
   while (!(window.claude && window.claude.use) && tries < 15){ await new Promise(r => setTimeout(r, 100)); tries++; }
