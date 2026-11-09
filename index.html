@@ -225,10 +225,12 @@ let unsubChamadas = null, loadTimer = null;
 const turma = id => S.turmas.find(t => t.id === id);
 const alunosDa = id => S.alunos.filter(a => a.turmaId === id).sort(porNome);
 const chamadaDe = aulaId => S.chamadas.find(c => c.aulaId === aulaId && c.data === S.hoje);
-const minha = a => S.mode === "local" || a.ownerId === S.uid;
-const podeEditar = a => !S.readOnly && (minha(a) || S.isOwner);
+const minha = a => S.mode === "local" || (!!a.ownerId && a.ownerId === S.uid);
+const semDono = a => S.mode !== "local" && !a.ownerId;
+const podeEditar = a => !S.readOnly && (minha(a) || semDono(a) || S.isOwner);
+const chaveNome = n => String(n||"").normalize("NFD").replace(/[̀-ͯ]/g,"").toLowerCase().replace(/\s+/g," ").trim();
 const diaHoje = () => new Date().getDay();
-const aulasHoje = () => S.aulas.filter(a => (a.dias||[]).includes(diaHoje())).sort((a,b) => (a.inicio||"").localeCompare(b.inicio||""));
+const aulasHoje = () => S.aulas.filter(a => (a.dias||[]).includes(diaHoje())).sort((a,b) => (a.inicio||"").localeCompare(b.inicio||"") || (a.materia||"").localeCompare(b.materia||"","pt-BR"));
 
 function statusAula(a){
   const c = chamadaDe(a.id), now = agoraHM();
@@ -244,15 +246,23 @@ function contagemLanches(){
     (porTurma[c.turmaId] || (porTurma[c.turmaId] = new Set()));
     (c.presentes||[]).forEach(id => porTurma[c.turmaId].add(id));
   });
+  // o mesmo nome em turmas diferentes (ex.: oficina e reforço) conta uma vez só
+  const turmasHoje = new Set(aulasHoje().map(a => a.turmaId));
+  const nomeDe = {}; S.alunos.forEach(a => nomeDe[a.id] = chaveNome(a.nome));
+  const presentesNomes = new Set(), possiveisNomes = new Set();
   const linhas = S.turmas.slice().sort(porNome).map(t => {
-    const total = alunosDa(t.id).length;
-    const set = porTurma[t.id];
-    return {t, total, presentes: set ? set.size : null};
-  });
-  const confirmados = linhas.reduce((s,l) => s + (l.presentes||0), 0);
+    const al = alunosDa(t.id), set = porTurma[t.id];
+    const temAula = !!set || turmasHoje.has(t.id);
+    if (set) set.forEach(id => { if (nomeDe[id]) presentesNomes.add(nomeDe[id]); });
+    else if (temAula) al.forEach(a => possiveisNomes.add(nomeDe[a.id]));
+    return {t, total: al.length, presentes: set ? set.size : null, temAula};
+  }).filter(l => l.temAula);
+  const somaTurmas = linhas.reduce((s,l) => s + (l.presentes||0), 0);
+  const confirmados = presentesNomes.size;
+  const repetidos = somaTurmas - confirmados;
   const pendentes = linhas.filter(l => l.presentes === null && l.total > 0);
-  const possiveis = pendentes.reduce((s,l) => s + l.total, 0);
-  return {linhas, confirmados, pendentes, possiveis};
+  const possiveis = [...possiveisNomes].filter(n => !presentesNomes.has(n)).length;
+  return {linhas, confirmados, pendentes, possiveis, repetidos};
 }
 
 /* ---------- gravação ---------- */
@@ -309,15 +319,25 @@ function vHoje(){
   }
   let lista = aulasHoje();
   const multi = S.mode === "db";
-  if (multi && S.filtro === "minhas") lista = lista.filter(minha);
+  const temMinhas = S.aulas.some(minha);
+  let aviso = "";
+  if (multi && S.filtro === "minhas"){
+    if (temMinhas) lista = lista.filter(minha);
+    else aviso = '<p class="muted small" style="margin:0">Você ainda não assumiu nenhuma aula, então aparecem todas. Na aba Aulas, toque em <b>Assumir</b> nas suas.</p>';
+  }
   const L = contagemLanches();
   let h = '';
   if (multi) h += '<div class="chips" role="group" aria-label="Filtro">'+
     '<button class="chip" data-filtro="minhas" aria-pressed="'+(S.filtro==="minhas")+'">Minhas aulas</button>'+
     '<button class="chip" data-filtro="todas" aria-pressed="'+(S.filtro==="todas")+'">Todas da escola</button></div>';
+  h += aviso;
   h += '<div class="stack"><div class="row between"><h2>Aulas de hoje</h2><span class="muted small num">'+lista.length+(lista.length===1?" aula":" aulas")+'</span></div>';
-  if (lista.length) h += '<div class="list">'+lista.map(a => cardAula(a,true)).join("")+'</div>';
-  else h += '<div class="panel"><p style="margin:0">Nenhuma aula '+(multi && S.filtro==="minhas" ? "sua " : "")+'marcada para '+esc(DIAS_LONGO[diaHoje()])+'.</p>'+
+  if (lista.length){
+    const grupos = [];
+    lista.forEach(a => { const k = a.inicio+"–"+a.fim; const g = grupos[grupos.length-1]; if (g && g.k === k) g.itens.push(a); else grupos.push({k, itens:[a]}); });
+    h += grupos.map(g => '<div class="stack" style="gap:6px"><span class="eyebrow num">'+esc(g.k)+'</span><div class="list">'+g.itens.map(a => cardAula(a,true)).join("")+'</div></div>').join("");
+  }
+  else h += '<div class="panel"><p style="margin:0">Nenhuma aula '+(multi && S.filtro==="minhas" && temMinhas ? "sua " : "")+'marcada para '+esc(DIAS_LONGO[diaHoje()])+'.</p>'+
     '<div class="row"><button class="btn ghost" data-act="nova-aula">Cadastrar aula</button><button class="link" data-goto="aulas">Fazer chamada de outra aula</button></div></div>';
   h += '</div>';
   h += '<button class="panel" data-goto="lanches" style="text-align:left;cursor:pointer;color:inherit">'+
@@ -328,6 +348,7 @@ function vHoje(){
 
 function vLanches(){
   const L = contagemLanches();
+  if (S.turmas.length && !L.linhas.length) return '<div class="panel empty"><h2>Lanches do recreio</h2><p class="muted" style="margin:0">Nenhuma turma tem aula hoje ('+esc(DIAS_LONGO[diaHoje()])+').</p></div>';
   if (!S.turmas.length) return '<div class="panel empty"><h2>Lanches do recreio</h2><p class="muted" style="margin:0">A contagem aparece aqui assim que houver turmas e as primeiras chamadas do dia.</p><div><button class="btn primary" data-goto="turmas">Criar turma</button></div></div>';
   let h = '<section class="hero"><span class="eyebrow">Lanches para preparar hoje</span>'+
     '<div class="big">'+L.confirmados+'<small>alunos presentes</small></div>'+
@@ -340,7 +361,7 @@ function vLanches(){
       (l.presentes === null ? '<span class="pill">sem chamada · '+l.total+' matric.</span>' : '<span class="num"><b>'+l.presentes+'</b> <span class="muted">de '+l.total+'</span></span>')+
       '</div><div class="bar" aria-hidden="true"><i style="width:'+pct+'%"></i></div></div>';
   }).join("")+'</div>';
-  h += '<p class="muted small" style="margin:0">Cada aluno conta uma vez por dia, mesmo que apareça em chamadas de várias matérias. Quem faltou em todas as chamadas da turma não entra na conta.</p></div>';
+  h += '<p class="muted small" style="margin:0">Cada aluno conta uma vez por dia, mesmo que apareça em chamadas de várias oficinas. Alunos com o mesmo nome em turmas diferentes (por exemplo, numa oficina e no reforço) contam como uma pessoa'+(L.repetidos > 0 ? '. Hoje '+L.repetidos+(L.repetidos===1?' aluno apareceu':' alunos apareceram')+' em mais de uma turma' : '')+'. Quem faltou em todas as chamadas não entra na conta.</p></div>';
   return h;
 }
 
@@ -359,15 +380,17 @@ function linhaAula(a){
   const t = turma(a.turmaId);
   const dias = (a.dias||[]).slice().sort().map(d => DIAS[d]).join(", ");
   return '<div class="item"><div class="grow"><b>'+esc(a.materia)+'</b><div class="muted small">'+esc(t ? t.nome : "Turma removida")+' · '+esc(dias || "sem dias")+' · '+esc(a.inicio)+'–'+esc(a.fim)+(a.professor ? '<br>'+esc(a.professor) : '')+'</div></div>'+
-    '<div class="row" style="flex-wrap:nowrap">'+(podeEditar(a) ? '<button class="btn ghost" data-act="editar-aula" data-id="'+esc(a.id)+'">Editar</button>' : '')+
+    '<div class="row" style="flex-wrap:nowrap">'+(semDono(a) && !S.readOnly ? '<button class="btn accent" data-act="assumir" data-id="'+esc(a.id)+'">Assumir</button>' : '')+
+    (podeEditar(a) && !semDono(a) ? '<button class="btn ghost" data-act="editar-aula" data-id="'+esc(a.id)+'">Editar</button>' : '')+
     '<button class="btn primary" data-act="chamada" data-id="'+esc(a.id)+'">Chamada</button></div></div>';
 }
 function vAulas(){
   const ord = (a,b) => (a.materia||"").localeCompare(b.materia||"","pt-BR") || (a.inicio||"").localeCompare(b.inicio||"");
-  const minhas = S.aulas.filter(minha).sort(ord), outras = S.aulas.filter(a => !minha(a)).sort(ord);
+  const minhas = S.aulas.filter(minha).sort(ord), livres = S.aulas.filter(semDono).sort(ord), outras = S.aulas.filter(a => !minha(a) && !semDono(a)).sort(ord);
   let h = '<div class="row between"><h2>'+(S.mode==="db" ? "Minhas aulas" : "Aulas")+'</h2>'+(S.readOnly ? '' : '<button class="btn accent" data-act="nova-aula">+ Nova aula</button>')+'</div>';
   h += minhas.length ? '<div class="list">'+minhas.map(linhaAula).join("")+'</div>'
     : '<div class="panel"><p style="margin:0" class="muted">Cadastre sua matéria com o nome que preferir, a turma, os dias da semana e o horário. Ela aparece na aba Hoje nos dias certos.</p></div>';
+  if (livres.length) h += '<div class="stack"><h2>Aulas sem professor</h2><p class="muted small" style="margin:0">Toque em <b>Assumir</b> nas aulas que você dá. Elas passam a aparecer em "Minhas aulas" com o seu nome.</p><div class="list">'+livres.map(linhaAula).join("")+'</div></div>';
   if (outras.length) h += '<div class="stack"><h2>Outros professores</h2><div class="list">'+outras.map(linhaAula).join("")+'</div></div>';
   return h;
 }
@@ -542,6 +565,13 @@ document.addEventListener("click", async ev => {
       if (await grava(() => S.store.del("aulas", id), "Aula excluída")) fecharSheet(); break;
     }
     case "copiar-lanches": copiarResumo(b); break;
+    case "assumir": {
+      const a = S.aulas.find(x => x.id === id); if (!a) break;
+      const nome = lsGet("diario-professor") || S.meuNome || "";
+      const doc = Object.assign({}, a); delete doc.id; doc.ownerId = S.uid; if (nome && !doc.professor) doc.professor = nome;
+      await grava(() => S.store.put("aulas", id, doc), "Aula assumida: "+a.materia);
+      break;
+    }
   }
 });
 
